@@ -1,0 +1,74 @@
+# Hosted-service build for ARTEX. The native image additionally embeds the admin
+# UI and a much larger browser/security toolbox; the hosted bridge only exposes
+# /api/service and keeps the admin control plane off the public ingress.
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY . .
+ARG ARTEX_VERSION=dev
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" \
+    go build -trimpath -ldflags "-s -w -X main.version=${ARTEX_VERSION}" \
+      -o /out/artex ./cmd/artex
+
+FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS tools
+ARG TARGETARCH=amd64
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl unzip && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) PD_ARCH=amd64; FFUF_ARCH=amd64; DALFOX_ARCH=x86_64 ;; \
+      arm64) PD_ARCH=arm64; FFUF_ARCH=arm64; DALFOX_ARCH=aarch64 ;; \
+      *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    mkdir -p /out; \
+    fetch() { base="$1"; asset="$2"; sums="$3"; name="$4"; \
+      rm -rf /tmp/t; mkdir -p /tmp/t/x; \
+      curl -fsSL "$base/$asset" -o "/tmp/t/$asset"; \
+      curl -fsSL "$base/$sums" -o /tmp/t/sums.txt; \
+      want="$(awk -v a="$asset" '$2 == a || $2 == "*" a { print $1 }' /tmp/t/sums.txt)"; \
+      [ -n "$want" ] || { echo "no checksum for $asset" >&2; exit 1; }; \
+      got="$(sha256sum "/tmp/t/$asset" | cut -d' ' -f1)"; \
+      [ "$want" = "$got" ] || { echo "checksum mismatch for $asset" >&2; exit 1; }; \
+      case "$asset" in *.zip) unzip -q "/tmp/t/$asset" -d /tmp/t/x ;; *) tar -xzf "/tmp/t/$asset" -C /tmp/t/x ;; esac; \
+      find /tmp/t/x -type f -name "$name" -exec install -m 0755 {} /out/ \;; \
+      [ -x "/out/$name" ] || { echo "$name missing" >&2; exit 1; }; }; \
+    gh="https://github.com"; \
+    fetch "$gh/projectdiscovery/nuclei/releases/download/v3.11.1" \
+      "nuclei_3.11.1_linux_${PD_ARCH}.zip" "nuclei_3.11.1_checksums.txt" nuclei; \
+    fetch "$gh/projectdiscovery/httpx/releases/download/v1.12.0" \
+      "httpx_1.12.0_linux_${PD_ARCH}.zip" "httpx_1.12.0_checksums.txt" httpx; \
+    fetch "$gh/projectdiscovery/subfinder/releases/download/v2.17.0" \
+      "subfinder_2.17.0_linux_${PD_ARCH}.zip" "subfinder_2.17.0_checksums.txt" subfinder; \
+    fetch "$gh/projectdiscovery/katana/releases/download/v1.8.0" \
+      "katana_1.8.0_linux_${PD_ARCH}.zip" "katana-1.8.0-checksums.txt" katana; \
+    fetch "$gh/ffuf/ffuf/releases/download/v2.3.0" \
+      "ffuf_2.3.0_linux_${FFUF_ARCH}.tar.gz" "ffuf_2.3.0_checksums.txt" ffuf; \
+    fetch "$gh/hahwul/dalfox/releases/download/v3.2.4" \
+      "dalfox-v3.2.4-linux-${DALFOX_ARCH}-musl.tar.gz" \
+      "dalfox-v3.2.4-linux-${DALFOX_ARCH}-musl.tar.gz.sha256" dalfox
+
+FROM python:3.12-slim-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl wget git jq unzip xz-utils ripgrep \
+      dnsutils iputils-ping netcat-openbsd whois nmap \
+      nodejs npm openssl procps python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m pip install --no-cache-dir --break-system-packages requests
+COPY --from=tools /out/ /usr/local/bin/
+WORKDIR /app
+COPY --from=build /out/artex /app/artex
+COPY start.sh /app/start.sh
+COPY skills/ /app/skills/
+RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin artex \
+    && mkdir -p /app/data /app/keys \
+    && chmod 0755 /app/artex /app/start.sh \
+    && chown -R artex:artex /app/data /app/keys
+USER 10001:10001
+VOLUME ["/app/data", "/app/keys"]
+EXPOSE 8787
+ENTRYPOINT ["/app/start.sh"]
+CMD ["-addr", ":8787", "-proxy", ""]

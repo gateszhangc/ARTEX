@@ -136,6 +136,10 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid task id")
 		return
 	}
+	s.deleteTaskByID(w, r, id)
+}
+
+func (s *Server) deleteTaskByID(w http.ResponseWriter, r *http.Request, id string) {
 	var opts DeleteTaskOptions
 	if err := decode(r, &opts); err != nil && err != io.EOF {
 		writeErr(w, 400, "invalid JSON: "+err.Error())

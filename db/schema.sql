@@ -583,12 +583,21 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS active_llm_profile_id BIGINT REFERENCES llm_profiles(id) ON DELETE SET NULL;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS llm_chain_revision BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+-- Hosted-service ownership. Native single-admin installations leave these empty;
+-- requests arriving through the trusted service bridge are scoped by owner.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS client_request_id TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_tasks_category ON tasks(category_id, created_at DESC)
     WHERE deleted_at IS NULL AND category_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_tasks_pinned ON tasks(pinned_at DESC)
     WHERE deleted_at IS NULL AND pinned_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_tasks_archived ON tasks(archived_at DESC)
     WHERE archived_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(owner_id, created_at DESC)
+    WHERE deleted_at IS NULL AND owner_id <> '';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_tasks_owner_client_request
+    ON tasks(owner_id, client_request_id)
+    WHERE deleted_at IS NULL AND owner_id <> '' AND client_request_id <> '';
 
 -- Cold task archives retain only compact metadata in PostgreSQL. The complete
 -- task payload lives in a versioned .tar.zst package under data/archives/tasks.

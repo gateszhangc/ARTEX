@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -31,6 +32,7 @@ import (
 type Task struct {
 	ID           string `json:"id"`
 	ExpID        int64  `json:"exploration_id"`
+	OwnerID      string `json:"-"`
 	Name         string `json:"name"` // optional task name; empty = unnamed
 	CategoryID   *int64 `json:"category_id,omitempty"`
 	CategoryName string `json:"category_name,omitempty"`
@@ -53,13 +55,13 @@ type Task struct {
 	LLMChainRevision   int64   `json:"-"`
 	LLMFailoverState   string  `json:"llm_failover_state,omitempty"`
 	// LLMRotate (#85): per-intent round-robin over the task's LLM chain heads.
-	LLMRotate  bool `json:"llm_rotate,omitempty"`
-	rotateMu   sync.Mutex
-	rotateNext int
-	LLMFailoverReason  string  `json:"llm_failover_reason,omitempty"`
-	SourceTaskIDs      []int64 `json:"source_task_ids,omitempty"`
-	CompanyIDs         []int64 `json:"company_ids,omitempty"`
-	Status             string  `json:"status"` // persisted lifecycle status (done/failed/timeout are terminal; empty/other is derived from runtime state)
+	LLMRotate         bool `json:"llm_rotate,omitempty"`
+	rotateMu          sync.Mutex
+	rotateNext        int
+	LLMFailoverReason string  `json:"llm_failover_reason,omitempty"`
+	SourceTaskIDs     []int64 `json:"source_task_ids,omitempty"`
+	CompanyIDs        []int64 `json:"company_ids,omitempty"`
+	Status            string  `json:"status"` // persisted lifecycle status (done/failed/timeout are terminal; empty/other is derived from runtime state)
 	// Task-level timeout (see docs/task-timeout-and-settle-design.md). DeadlineAt/FirstRunAt are unix seconds, 0 = unset/not yet run.
 	TimeoutSeconds       int                    `json:"timeout_seconds"`
 	PlanHeartbeatSeconds int                    `json:"plan_heartbeat_seconds"` // planner heartbeat trigger interval (seconds)
@@ -244,12 +246,14 @@ type DeleteTaskResult struct {
 // Manager owns the PostgreSQL data source (asset graph + every task's exploration
 // graph + config) and the in-memory set of task handles.
 type Manager struct {
-	dir         string
-	pg          *pgdb.DB
-	assets      *pgdb.AssetStore
-	traffic     *traffic.Traffic       // process-wide recording proxy (may be nil)
-	enrich      *enrich.Engine         // engine-side asset auto-completion (DNS/HTTP)
-	interceptor *intercept.Interceptor // user-configured tool-call interception rules
+	dir            string
+	pg             *pgdb.DB
+	assets         *pgdb.AssetStore
+	traffic        *traffic.Traffic // process-wide recording proxy (may be nil)
+	ownerTraffic   map[string]*traffic.Traffic
+	ownerTrafficMu sync.Mutex
+	enrich         *enrich.Engine         // engine-side asset auto-completion (DNS/HTTP)
+	interceptor    *intercept.Interceptor // user-configured tool-call interception rules
 
 	companyMu sync.Mutex // serializes task/company-scope commits with live handle registration
 	// taskStateMu preserves commit order between PostgreSQL lifecycle writes and
@@ -401,7 +405,7 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	if err := pg.EnsureLLMUsageTable(); err != nil {
 		log.Printf("[llmusage] create table: %v", err)
 	}
-	m := &Manager{dir: dir, pg: pg, assets: pg.Assets(), tasks: map[string]*Task{}, interceptor: intercept.New(pg)}
+	m := &Manager{dir: dir, pg: pg, assets: pg.Assets(), tasks: map[string]*Task{}, ownerTraffic: map[string]*traffic.Traffic{}, interceptor: intercept.New(pg)}
 	// Behind the global egress proxy a target approval is name-only.
 	m.interceptor.SetUpstreamProxyCheck(func() bool { return m.GlobalProxy() != "" })
 	// The platform's own endpoints need no target approval.
@@ -433,7 +437,7 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 			m.traffic = tr
 			go func() {
 				log.Printf("[traffic] recording proxy on %s (set HTTP_PROXY=%s + trust _ca CA)", proxyAddr, tr.ProxyAddr())
-				if err := tr.Start(); err != nil {
+				if err := tr.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 					log.Printf("[traffic] proxy stopped: %v", err)
 				}
 			}()
@@ -835,6 +839,14 @@ func (m *Manager) SetGlobalProxy(raw string) error {
 func (m *Manager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.ownerTrafficMu.Lock()
+	for _, tr := range m.ownerTraffic {
+		if tr != nil {
+			_ = tr.Close()
+		}
+	}
+	m.ownerTraffic = map[string]*traffic.Traffic{}
+	m.ownerTrafficMu.Unlock()
 	if m.traffic != nil {
 		m.traffic.Close()
 	}
@@ -863,6 +875,7 @@ func unixNanoOrZero(t *time.Time) int64 {
 func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Interceptor) *Task {
 	t := &Task{
 		ID: strconv.FormatInt(pt.ID, 10), ExpID: pt.ExplorationID,
+		OwnerID:    pt.OwnerID,
 		Name:       pt.Name,
 		CategoryID: cloneInt64Ptr(pt.CategoryID), CategoryName: pt.CategoryName,
 		PinnedAt:    unixOrZero(pt.PinnedAt),
@@ -1559,12 +1572,19 @@ func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResul
 
 	var trafficStage *traffic.HostDeleteStage
 	var prepare func(pgdb.TaskDeletePreparation) error
-	if opts.DeleteTraffic && m.traffic != nil {
+	trafficStore := m.traffic
+	if registered.OwnerID != "" {
+		trafficStore, err = m.TrafficForOwner(registered.OwnerID)
+		if err != nil {
+			return result, fmt.Errorf("open owner traffic store: %w", err)
+		}
+	}
+	if opts.DeleteTraffic && trafficStore != nil {
 		prepare = func(p pgdb.TaskDeletePreparation) error {
 			if len(p.TrafficHosts) == 0 {
 				return nil
 			}
-			trafficStage, err = m.traffic.StageDeleteHostsExact(p.TrafficHosts)
+			trafficStage, err = trafficStore.StageDeleteHostsExact(p.TrafficHosts)
 			if err != nil {
 				return err
 			}
@@ -1833,6 +1853,27 @@ func (m *Manager) List() []*Task {
 		if iState.PinnedAt != jState.PinnedAt {
 			return iState.PinnedAt > jState.PinnedAt
 		}
+		ai, _ := strconv.ParseInt(out[i].ID, 10, 64)
+		aj, _ := strconv.ParseInt(out[j].ID, 10, 64)
+		return ai > aj
+	})
+	return out
+}
+
+// ListForOwner returns only hosted-service tasks belonging to ownerID.
+func (m *Manager) ListForOwner(ownerID string) []*Task {
+	if ownerID == "" {
+		return nil
+	}
+	m.mu.RLock()
+	out := make([]*Task, 0)
+	for _, task := range m.tasks {
+		if task.OwnerID == ownerID {
+			out = append(out, task)
+		}
+	}
+	m.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool {
 		ai, _ := strconv.ParseInt(out[i].ID, 10, 64)
 		aj, _ := strconv.ParseInt(out[j].ID, 10, 64)
 		return ai > aj

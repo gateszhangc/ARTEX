@@ -368,6 +368,9 @@ func (t *Traffic) Close() error {
 		t.closeOnce.Do(func() { close(t.closed) })
 	}
 	t.reaping.Wait()
+	if t.proxy != nil {
+		_ = t.proxy.Close()
+	}
 	return t.db.Close()
 }
 

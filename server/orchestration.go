@@ -40,7 +40,14 @@ func jsonResult(v any) (actool.Result, error) {
 // decides who actually sees any of them.
 //
 //nolint:unused // used as the hostTools provider in wireAgentAugment
-func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
+func (s *Server) hostTools(ctx context.Context) ([]actool.CoreTool, map[string][]string) {
+	run := agent.RunInfoFrom(ctx)
+	task, _ := s.m.Task(strconv.FormatInt(run.TaskID, 10))
+	if task != nil && task.OwnerID != "" {
+		// Hosted-service agents receive only their own owner-scoped traffic tools.
+		// Cross-task/platform tools are intentionally withheld from this path.
+		return s.m.HostToolsForTask(task), nil
+	}
 	tools := append(s.m.HostTools(), s.orchestrationTools()...)
 	tools = append(tools, s.findingRetestTools()...)
 	tools = append(tools, s.platformTools()...) // platform operation tools (create/edit skills/tools/MCP, for Auto)

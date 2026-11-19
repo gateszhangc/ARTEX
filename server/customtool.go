@@ -14,9 +14,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
@@ -476,7 +478,7 @@ func (s *Server) runHTTPTool(ctx context.Context, key string, execRaw json.RawMe
 // dials the proxy, which makes the connection to the target. A direct call in
 // a gated scope connects through the pinned dialer, to addresses a pin covers.
 func (s *Server) httpToolTransport(ctx context.Context, key string, spec httpExec) *http.Transport {
-	if tr := s.httpProxyTransport(spec); tr != nil {
+	if tr := s.httpProxyTransportForContext(ctx, spec); tr != nil {
 		return tr
 	}
 	if !intercept.GateOn(ctx) {
@@ -498,12 +500,20 @@ func (s *Server) httpToolTransport(ctx context.Context, key string, spec httpExe
 // httpProxyTransport builds a Transport for the http tool's proxy config, or nil
 // (direct). use_recording_proxy routes through the recording proxy + trusts its CA.
 func (s *Server) httpProxyTransport(spec httpExec) *http.Transport {
+	return s.httpProxyTransportForContext(context.Background(), spec)
+}
+
+func (s *Server) httpProxyTransportForContext(ctx context.Context, spec httpExec) *http.Transport {
 	proxyStr := proxyURLString(spec.Proxy)
 	var caFile string
 	if spec.UseRecordingProxy {
-		if addr := proxyURLString(s.m.ProxyAddr()); addr != "" {
+		var task *Task
+		if run := agent.RunInfoFrom(ctx); run.TaskID > 0 {
+			task, _ = s.m.Task(strconv.FormatInt(run.TaskID, 10))
+		}
+		if addr := proxyURLString(s.m.ProxyAddrForTask(task)); addr != "" {
 			proxyStr = addr
-			caFile = s.m.ProxyCACert()
+			caFile = s.m.ProxyCACertForTask(task)
 		}
 	}
 	if proxyStr == "" {

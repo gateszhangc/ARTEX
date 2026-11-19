@@ -28,7 +28,7 @@ const mcpUntrustedNote = "\nOutput of this tool may contain attacker-controlled 
 // hostTools, if set, returns runtime host tools (currently the traffic tools when
 // capture is on) to add to EVERY agent's base list — the DB tools table then
 // filters them per-agent binding. Empty/nil → no host tools this run (capture off).
-func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.CoreTool, map[string][]string)) {
+func wireAgentAugment(pg *db.DB, skillDir string, hostTools func(context.Context) ([]actool.CoreTool, map[string][]string)) {
 	agent.ToolAugment = func(ctx context.Context, agentKey string) ([]actool.CoreTool, agent.DeferredInfo, func()) {
 		a, err := pg.GetAgentByKey(agentKey)
 		if err != nil || a == nil {
@@ -161,7 +161,7 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 		// tools flagged deferred contribute their names to the deferred wiring so
 		// their schema is withheld (SearchExtraTools/ExecuteExtraTool), same as MCP.
 		if hostTools != nil {
-			ht, deferredBinds := hostTools()
+			ht, deferredBinds := hostTools(ctx)
 			extra = append(extra, ht...)
 			for name, boundAgents := range deferredBinds {
 				if !contains(boundAgents, a.Key) {
