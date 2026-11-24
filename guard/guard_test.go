@@ -212,4 +212,50 @@ func TestShortBlockReasonUnchanged(t *testing.T) {
 	}
 }
 
+func TestAskRuleFailsClosedWhenManualApprovalsAreDisabled(t *testing.T) {
+	ic := intercept.New(nil)
+	ic.SetRulesForTest([]db.InterceptRule{
+		{
+			ID: 1, Name: "Sensitive action", Enabled: true, Priority: 100,
+			MatchTarget: "tool_input", MatchType: "string", Action: "ask",
+			Pattern: "sensitive-marker", Message: "operator confirmation required",
+		},
+	})
+	ic.SetManualApprovals(false)
+
+	block, msg := pre(
+		NewWithInterceptor(ic),
+		context.Background(),
+		"Bash",
+		`{"command":"run sensitive-marker"}`,
+	)
+	if !block {
+		t.Fatal("ask rule was not converted to a block")
+	}
+	if !strings.Contains(msg, "manual approvals are disabled") ||
+		!strings.Contains(msg, "operator confirmation required") {
+		t.Fatalf("unexpected block message: %q", msg)
+	}
+}
+
+func TestUnapprovedTargetFailsClosedWithoutRequest(t *testing.T) {
+	ic := intercept.New(nil)
+	ic.SetRulesForTest(nil)
+	ic.SetManualApprovals(false)
+	g := NewTargetOnly(ic)
+	gate := &fakeGate{t: t, check: func(int) ([]intercept.TargetRequest, intercept.TargetResult) {
+		return []intercept.TargetRequest{appTarget}, intercept.TargetResult{}
+	}}
+	g.gate = gate
+
+	block, msg := pre(g, gateOn(context.Background(), "7", time.Minute), "WebFetch", fetchApp)
+	if !block || !strings.Contains(msg, intercept.TargetDenied) ||
+		!strings.Contains(msg, "manual approvals are disabled") {
+		t.Fatalf("block=%v msg=%q", block, msg)
+	}
+	if len(gate.asked) != 0 {
+		t.Fatalf("unapproved target opened %d manual requests", len(gate.asked))
+	}
+}
+
 var _ = hook.PreToolUse

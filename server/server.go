@@ -171,6 +171,17 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	for _, o := range opts {
 		o(s)
 	}
+	// The hosted bridge has no operator approval UI. Fail closed on ask decisions
+	// instead of waiting forever for a human. Self-hosted mode keeps the capability
+	// available behind the existing engine UI. ARTEX_MANUAL_APPROVALS can restore
+	// the low-level behavior explicitly when the hosted approval UI is reintroduced.
+	manualApprovals := s.serviceToken == ""
+	if raw := strings.TrimSpace(os.Getenv("ARTEX_MANUAL_APPROVALS")); raw != "" {
+		if enabled, err := strconv.ParseBool(raw); err == nil {
+			manualApprovals = enabled
+		}
+	}
+	s.m.interceptor.SetManualApprovals(manualApprovals)
 	s.initSetupToken()
 	s.initSideQuestions()
 	// Circuit-breaker thresholds/cooldowns are hot parameters on the failure path; push the global retry policy to the Registry once at startup,

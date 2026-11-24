@@ -170,6 +170,17 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 		g.interceptor.Log(ctx, intercept.ConvIDFromContext(ctx), dec, ev.ToolName, ev.Input, "denied")
 		return g.block(ev.ToolName, systemBlockMessage(dec.Message), "")
 	}
+	if dec.Action == "ask" && !g.interceptor.ManualApprovalsEnabled() {
+		reason := "manual approvals are disabled; the sensitive action was blocked automatically"
+		if dec.Message != "" {
+			reason += ": " + dec.Message
+		}
+		dec.Action = "deny"
+		dec.Message = reason
+		dec.TimeoutEnabled = false
+		g.interceptor.Log(ctx, intercept.ConvIDFromContext(ctx), dec, ev.ToolName, ev.Input, "denied")
+		return g.block(ev.ToolName, systemBlockMessage(reason), "")
+	}
 	var unpinned []intercept.TargetRequest
 	if gated {
 		var res intercept.TargetResult
@@ -192,6 +203,29 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 		ask = &dec
 	}
 	if len(unpinned) > 0 {
+		if !g.interceptor.ManualApprovalsEnabled() {
+			target := unpinned[0]
+			name := target.Host
+			if target.Port > 0 {
+				name = net.JoinHostPort(target.Host, strconv.Itoa(target.Port))
+			}
+			reason := fmt.Sprintf("manual approvals are disabled; target %s is not pre-approved and was blocked", name)
+			g.interceptor.Log(
+				ctx,
+				intercept.ConvIDFromContext(ctx),
+				intercept.Decision{Action: "deny", Message: reason},
+				ev.ToolName,
+				ev.Input,
+				"denied",
+			)
+			return g.block(
+				ev.ToolName,
+				TargetBlockMessage(intercept.TargetResult{
+					Code: intercept.TargetDenied, Host: target.Host, Port: target.Port, Reason: reason,
+				}),
+				"",
+			)
+		}
 		res, merged := g.requestTargets(ctx, scope, ev, unpinned, ask)
 		if res.Code != "" {
 			return g.block(ev.ToolName, TargetBlockMessage(res), "")

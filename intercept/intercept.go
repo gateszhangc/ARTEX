@@ -177,8 +177,11 @@ type Interceptor struct {
 	mu           sync.RWMutex
 	cached       []compiledRule  // sorted by priority DESC; nil means not loaded yet
 	enabledTools map[string]bool // nil means not loaded yet
-	pending      *pendingManager
-	reviewer     Reviewer // nil = LLM fallback judge not wired
+	// manualApprovals controls whether an ask waits for an operator decision.
+	// Hosted mode disables it so sensitive actions fail closed immediately.
+	manualApprovals bool
+	pending         *pendingManager
+	reviewer        Reviewer // nil = LLM fallback judge not wired
 	// upstreamProxy reports whether target traffic leaves through an upstream
 	// egress proxy (nil = no). Injected by the server layer.
 	upstreamProxy func() bool
@@ -223,8 +226,24 @@ var defaultEnabledTools = []string{
 // New creates an Interceptor backed by d. The rule cache is lazy-loaded on
 // first use.
 func New(d *db.DB) *Interceptor {
-	return &Interceptor{db: d, pending: newPendingManager(),
+	return &Interceptor{db: d, manualApprovals: true, pending: newPendingManager(),
 		targets: dbTargetStore{d}, resolve: newResolveCache(systemResolver{}), dial: baseDial}
+}
+
+// SetManualApprovals enables or disables waiting for an operator decision. When
+// disabled, callers fail closed on ask decisions instead of creating pending
+// requests. The setting is shared by every guard backed by this interceptor.
+func (i *Interceptor) SetManualApprovals(enabled bool) {
+	i.mu.Lock()
+	i.manualApprovals = enabled
+	i.mu.Unlock()
+}
+
+// ManualApprovalsEnabled reports whether ask decisions may wait for an operator.
+func (i *Interceptor) ManualApprovalsEnabled() bool {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.manualApprovals
 }
 
 // Invalidate clears the in-memory rule cache and the enabled-tools cache.
